@@ -18,6 +18,12 @@ class JiraClient:
         self.API_TOKEN = config["JIRA"]["TOKEN"]
         self.EMAIL = config["JIRA"]["EMAIL"]
 
+        # Cargar mapeo desde Excel
+        excel_mappings = self.load_excel_mappings(config["XLS"]["MAPPING_FILE"])
+        self.recursos_df = excel_mappings["Recursos"]
+        self.tareas_df = excel_mappings["Tareas"]
+        self.epicas_df = excel_mappings["Epicas"]
+
         # Configuración de autenticación básica
         auth_string = f"{self.EMAIL}:{self.API_TOKEN}".encode("utf-8")
         base64_auth = base64.b64encode(auth_string).decode("utf-8")
@@ -164,14 +170,111 @@ class JiraClient:
 
         return filtered_worklogs
 
-    def load_epicas_mapping(self, excel_path: str) -> None:
+    def load_excel_mappings(self, excel_path: str) -> Dict[str, pd.DataFrame]:
         """
-        Carga el archivo Excel que contiene el mapeo de Epicas a Proyecto Económico.
+        Carga las tres hojas del archivo Excel en DataFrames de pandas.
 
-        :param excel_path: Ruta al archivo Excel
-        :return: DataFrame con el mapeo
+        :param excel_path: Ruta al archivo Excel.
+        :return: Diccionario con DataFrames de cada hoja.
         """
-        self.epicas_df = pd.read_excel(excel_path, sheet_name="Sheet1")
+        try:
+            xls = pd.ExcelFile(excel_path)
+            recursos_df = pd.read_excel(xls, sheet_name="Recursos")
+            tareas_df = pd.read_excel(xls, sheet_name="Tareas")
+            epicas_df = pd.read_excel(xls, sheet_name="Epicas")
+            return {
+                "Recursos": recursos_df,
+                "Tareas": tareas_df,
+                "Epicas": epicas_df
+            }
+        except Exception as e:
+            print(f"Error al cargar el archivo Excel: {e}")
+            raise
+
+
+    def filter_worklogs_by_recursos(self, worklogs_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Filtra los worklogs para incluir solo aquellos generados por los recursos listados.
+
+        :param worklogs_df: DataFrame de worklogs.
+        :param recursos_df: DataFrame de recursos.
+        :return: DataFrame filtrado de worklogs.
+        """
+        recursos_list = self.recursos_df['Recurso'].dropna().unique().tolist()
+        filtered_worklogs = worklogs_df[worklogs_df['author_displayName'].isin(recursos_list)]
+        return filtered_worklogs
+
+
+    def assign_proyecto_economico(self, worklogs_df: pd.DataFrame, issues_df: pd.DataFrame) -> (pd.DataFrame, pd.DataFrame):
+        """
+        Asigna el Proyecto Económico a cada worklog basándose en Tareas y Epicas.
+
+        :param worklogs_df: DataFrame de worklogs filtrados.
+        :param issues_df: DataFrame de issues con detalles.
+        :param tareas_df: DataFrame de mapeo de Tareas.
+        :param epicas_df: DataFrame de mapeo de Epicas.
+        :return: Tuple de DataFrames (cruzados, no_cruzados).
+        """
+        # Crear DataFrame de issues con campos necesarios
+        issues_filtered = issues_df[['id', 'key', 'parent']].copy()
+        issues_filtered.rename(columns={'id': 'issue_Id', 'key': 'issue_key', 'parent': 'parent_key'}, inplace=True)
+
+        # Merge worklogs con issues para obtener parent_key
+        merged_df = worklogs_df.merge(issues_filtered, left_on='issueId', right_on='issue_Id', how='left')
+
+        # Asignar Proyecto_Economico según Tareas
+        merged_df = merged_df.merge(self.tareas_df, left_on='issue_key', right_on='KEY', how='left', suffixes=('', '_tareas'))
+        merged_df.rename(columns={'Proyecto_Economico': 'Proyecto_Economico_Tareas'}, inplace=True)
+
+        # Asignar Proyecto_Economico según Epicas donde Tareas no asignaron
+        epicas_mapping = self.epicas_df.set_index('Parent_Key')['Proyecto_Economico'].to_dict()
+        merged_df['Proyecto_Economico_Epicas'] = merged_df['parent_key'].map(epicas_mapping)
+
+        # Determinar Proyecto_Economico con precedencia a Tareas
+        merged_df['Proyecto_Economico'] = merged_df['Proyecto_Economico_Tareas'].combine_first(merged_df['Proyecto_Economico_Epicas'])
+
+        # Separar en cruzados y no cruzados
+        cruzados_df = merged_df[merged_df['Proyecto_Economico'].notna()].copy()
+        no_cruzados_df = merged_df[merged_df['Proyecto_Economico'].isna()].copy()
+
+        return cruzados_df, no_cruzados_df
+
+
+    def worklogs_to_dataframe(self, worklogs: List[Dict[str, Any]]) -> pd.DataFrame:
+        """
+        Convierte una lista de worklogs a un DataFrame de pandas.
+
+        :param worklogs: Lista de diccionarios de worklogs.
+        :return: DataFrame de worklogs.
+        """
+        # Normalizar la estructura anidada de worklogs
+        worklogs_normalized = pd.json_normalize(worklogs)
+        worklogs_normalized = worklogs_normalized[['id', 'issueId', 'author.displayName', 'started', 'timeSpentSeconds', 'updated']]
+        # Renombrar columnas para facilitar el acceso
+        worklogs_normalized.rename(columns={
+            'author.displayName': 'author_displayName',
+            'started': 'started',
+            'timeSpentSeconds': 'timeSpentSeconds',
+            # Agrega otros campos según sea necesario
+        }, inplace=True)
+        return worklogs_normalized
+
+    def issues_to_dataframe(self, issues: List[Dict[str, Any]]) -> pd.DataFrame:
+        """
+        Convierte una lista de issues a un DataFrame de pandas.
+
+        :param issues: Lista de diccionarios de issues.
+        :return: DataFrame de issues.
+        """
+        issues_normalized = pd.json_normalize(issues)
+        # Renombrar columnas para facilitar el acceso
+        issues_normalized.rename(columns={
+            'key': 'key',
+            'fields.project.name': 'project',
+            'fields.summary': 'summary',
+            'fields.parent.key': 'parent'
+        }, inplace=True)
+        return issues_normalized
 
 
 # **Ejemplo de Uso**
@@ -195,6 +298,64 @@ if __name__ == "__main__":
     worklogs_in_range = client.retrieve_worklogs_in_date_range(start_date, end_date)
     print(f"Cantidad de worklogs en el rango: {len(worklogs_in_range)}")
 
+    # Convertir worklogs a DataFrame
+    worklogs_df = client.worklogs_to_dataframe(worklogs_in_range)
+
     # Recuperar issues asociadas a los worklogs
     issues_for_worklogs = client.retrieve_issues_for_worklogs(worklogs_in_range, fields=["key", "project", "summary", "parent"])
     print(f"Cantidad de issues recuperadas: {len(issues_for_worklogs)}")
+
+    # Convertir issues a DataFrame
+    issues_df = client.issues_to_dataframe(issues_for_worklogs)
+
+    # Filtrar worklogs por recursos
+    filtered_worklogs_df = client.filter_worklogs_by_recursos(worklogs_df)
+    print(f"Cantidad de worklogs después de filtrar por recursos: {len(filtered_worklogs_df)}")
+
+    # Asignar Proyecto_Economico
+    cruzados_df, no_cruzados_df = client.assign_proyecto_economico(
+        filtered_worklogs_df,
+        issues_df
+    )
+    print(f"Worklogs cruzados: {len(cruzados_df)}")
+    print(f"Worklogs no cruzados: {len(no_cruzados_df)}")
+
+    def generate_output_files(cruzados: pd.DataFrame, no_cruzados: pd.DataFrame, output_path_cruzados: str, output_path_no_cruzados: str):
+        """
+        Genera archivos Excel para los worklogs cruzados y no cruzados.
+
+        :param cruzados: DataFrame de worklogs cruzados.
+        :param no_cruzados: DataFrame de worklogs no cruzados.
+        :param output_path_cruzados: Ruta de salida para worklogs cruzados.
+        :param output_path_no_cruzados: Ruta de salida para worklogs no cruzados.
+        """
+        # Procesar worklogs cruzados
+        cruzados_processed = cruzados.copy()
+        cruzados_processed.rename(columns={
+            "author_displayName": "AD_Usuario",
+            "started": "Fecha_Worklog",
+            "timeSpentSeconds": "Cantidad_Horas",
+            "Proyecto_Economico": "ID_Proyecto"
+            # Puedes agregar más renombramientos si es necesario
+        }, inplace=True)
+        # Convertir segundos a horas
+        cruzados_processed['Cantidad_Horas'] = cruzados_processed['Cantidad_Horas'] / 3600
+        # Seleccionar columnas necesarias
+        cruzados_final = cruzados_processed[['AD_Usuario', 'Fecha_Worklog', 'Cantidad_Horas', 'ID_Proyecto', 'N_Proyecto_Economico']].copy()
+        cruzados_final.rename(columns={'N_Proyecto_Economico': 'Nombre_Proyecto'}, inplace=True)
+
+        # Guardar worklogs cruzados a Excel
+        cruzados_final.to_excel(output_path_cruzados, index=False)
+
+        # Guardar worklogs no cruzados a Excel
+        no_cruzados.to_excel(output_path_no_cruzados, index=False)
+
+    # Generar los archivos de salida
+    generate_output_files(
+        cruzados_df,
+        no_cruzados_df,
+        "worklogs_cruzados.xlsx",
+        "worklogs_no_cruzados.xlsx"
+    )
+
+    print("Archivos generados exitosamente.")
